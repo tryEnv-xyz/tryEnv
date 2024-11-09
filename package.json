@@ -1,15 +1,16 @@
 {
-  "name": "tryenv-htf",
-  "displayName": "tryEnv-htf",
+  "name": "tryenv",
+  "displayName": "tryEnv",
   "publisher": "tryenv",
   "description": "tryEnv  is a collaboratively built developer tool by a team of Developers who faced issues while managing their projects' environment variables and not having a streamlined, transparent and seamless management system to do the same.",
   "version": "0.0.1",
+  "icon": "./resources/tryEnv_logo.jpg",
   "engines": {
     "vscode": "^1.95.0"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/tryEnv-xyz/tryEnv-htf"
+    "url": "https://github.com/tryEnv-xyz/tryEnv"
   },
   "categories": [
     "Other"
@@ -21,7 +22,7 @@
       "activitybar": [
         {
           "id": "tryenv-explorer",
-          "title": "TryEnv Explorer",
+          "title": "tryEnv Explorer",
           "icon": "./resources/tryenv.svg"
         }
       ]
