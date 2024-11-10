@@ -71,4 +71,4 @@ Version 1.0.0 – Initial release of tryEnv!
  
 ## Support
 
-For any questions or issues, feel free to contact our support team or raise an issue on our GitHub repository
+For any questions or issues, feel free to [contact](mailto:tryenvcontact@gmail.com) our support team or raise an issue on our GitHub repository
