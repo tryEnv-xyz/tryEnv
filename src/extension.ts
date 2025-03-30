@@ -1,16 +1,24 @@
+// File: src/extension.ts
 import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import * as vscode from 'vscode';
 import { v4 as uuidv4 } from 'uuid';
 import { exec } from 'child_process';
+import { promisify } from 'util';
+import * as os from 'os';
 
+const execAsync = promisify(exec);
+
+// Cryptography constants
 const ALGORITHM = 'aes-256-gcm';
 const IV_LENGTH = 16;
 const SALT_LENGTH = 64;
 const KEY_LENGTH = 32;
 const ENCODING = 'utf-8';
+const EXTENSION_NAME = 'tryEnv';
 
+// Interface definitions
 interface EnvProject {
     id: string;
     name: string;
@@ -18,6 +26,11 @@ interface EnvProject {
         preview: Record<string, EncryptedData>;
         development: Record<string, EncryptedData>;
         production: Record<string, EncryptedData>;
+    };
+    metadata?: {
+        created: string;
+        lastModified: string;
+        description?: string;
     };
 }
 
@@ -28,60 +41,105 @@ interface EncryptedData {
     salt: string;
 }
 
+interface ImportData {
+    format: 'encrypted' | 'plain';
+    data: Record<string, string> | Record<string, EncryptedData>;
+}
+
+interface ParsedEnvironmentFile {
+    variables: Record<string, string | EncryptedData>;
+    format: string;
+}
+
 type TreeItemType = 'project' | 'instance';
+type EnvInstance = 'preview' | 'development' | 'production';
 
-function execShellCommand(cmd: string): Promise<string> {
-    return new Promise((resolve, reject) => {
-        exec(cmd, (error, stdout, stderr) => {
-            if (error) {
-                reject(stderr || stdout);
-            } else {
-                resolve(stdout.trim());
-            }
-        });
-    });
+// Output channel for logging
+let outputChannel: vscode.OutputChannel;
+
+// Utility function to get output channel
+function getOutputChannel(): vscode.OutputChannel {
+    if (!outputChannel) {
+        outputChannel = vscode.window.createOutputChannel(EXTENSION_NAME);
+    }
+    return outputChannel;
 }
 
+// Log to output channel
+function log(message: string): void {
+    const channel = getOutputChannel();
+    const timestamp = new Date().toISOString();
+    channel.appendLine(`[${timestamp}] ${message}`);
+}
+
+// Cross-platform command execution
+async function execShellCommand(cmd: string): Promise<string> {
+    try {
+        log(`Executing command: ${cmd}`);
+        const { stdout, stderr } = await execAsync(cmd);
+        if (stderr && !stdout) {
+            throw new Error(stderr);
+        }
+        return stdout.trim();
+    } catch (error) {
+        log(`Error executing command: ${error}`);
+        throw error;
+    }
+}
+
+// Encryption function
 function encrypt(text: string, projectId: string): EncryptedData {
-    const iv = crypto.randomBytes(IV_LENGTH);
-    const salt = crypto.randomBytes(SALT_LENGTH);
-    const key = crypto.pbkdf2Sync(projectId, salt, 100000, KEY_LENGTH, 'sha512');
+    try {
+        const iv = crypto.randomBytes(IV_LENGTH);
+        const salt = crypto.randomBytes(SALT_LENGTH);
+        const key = crypto.pbkdf2Sync(projectId, salt, 100000, KEY_LENGTH, 'sha512');
 
-    const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
-    let encrypted = cipher.update(text, ENCODING, 'base64');
-    encrypted += cipher.final('base64');
+        const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
+        let encrypted = cipher.update(text, ENCODING, 'base64');
+        encrypted += cipher.final('base64');
 
-    return {
-        encrypted: encrypted,
-        iv: iv.toString('base64'),
-        tag: cipher.getAuthTag().toString('base64'),
-        salt: salt.toString('base64')
-    };
+        return {
+            encrypted: encrypted,
+            iv: iv.toString('base64'),
+            tag: cipher.getAuthTag().toString('base64'),
+            salt: salt.toString('base64')
+        };
+    } catch (error) {
+        log(`Encryption error: ${error}`);
+        throw new Error(`Failed to encrypt data: ${error}`);
+    }
 }
 
+// Decryption function
 function decrypt(encryptedData: EncryptedData, projectId: string): string {
-    const key = crypto.pbkdf2Sync(
-        projectId,
-        Buffer.from(encryptedData.salt, 'base64'),
-        100000,
-        KEY_LENGTH,
-        'sha512'
-    );
+    try {
+        const key = crypto.pbkdf2Sync(
+            projectId,
+            Buffer.from(encryptedData.salt, 'base64'),
+            100000,
+            KEY_LENGTH,
+            'sha512'
+        );
 
-    const decipher = crypto.createDecipheriv(
-        ALGORITHM,
-        key,
-        Buffer.from(encryptedData.iv, 'base64')
-    );
+        const decipher = crypto.createDecipheriv(
+            ALGORITHM,
+            key,
+            Buffer.from(encryptedData.iv, 'base64')
+        );
 
-    decipher.setAuthTag(Buffer.from(encryptedData.tag, 'base64'));
+        decipher.setAuthTag(Buffer.from(encryptedData.tag, 'base64'));
 
-    let decrypted = decipher.update(encryptedData.encrypted, 'base64', ENCODING);
-    decrypted += decipher.final(ENCODING);
+        let decrypted = decipher.update(encryptedData.encrypted, 'base64', ENCODING);
+        decrypted += decipher.final(ENCODING);
 
-    return decrypted;
+        return decrypted;
+    } catch (error) {
+        log(`Decryption error: ${error}`);
+        return '[Decryption Error]';
+    }
 }
 
+// GitHub integration functions
 async function checkGitHubAuth(): Promise<void> {
     try {
         await execShellCommand('gh auth status');
@@ -97,15 +155,120 @@ async function getGitHubUsername(): Promise<string> {
 async function ensureGitHubRepo(username: string, repoName: string): Promise<void> {
     try {
         await execShellCommand(`gh repo view ${username}/${repoName}`);
+        log(`Repository ${username}/${repoName} already exists`);
     } catch {
+        log(`Creating repository ${username}/${repoName}`);
         await execShellCommand(`gh repo create ${repoName} --private --confirm`);
     }
 }
 
+// File format conversion functions
+function generateEnvFileContent(variables: Record<string, string>): string {
+    let content = '# Environment Variables\n# Generated by tryEnv\n\n';
+    for (const [key, value] of Object.entries(variables)) {
+        // Handle values with spaces by adding quotes
+        const formattedValue = value.includes(' ') || value.includes('\n') || value.includes(',')
+            ? `"${value.replace(/"/g, '\\"')}"`
+            : value;
+        content += `${key}=${formattedValue}\n`;
+    }
+    return content;
+}
+
+function parseEnvFileContent(content: string): Record<string, string> {
+    const variables: Record<string, string> = {};
+    const lines = content.split('\n');
+
+    for (const line of lines) {
+        const trimmedLine = line.trim();
+        if (!trimmedLine || trimmedLine.startsWith('#')) {
+            continue;
+        }
+
+        const equalIndex = trimmedLine.indexOf('=');
+        if (equalIndex === -1) {
+            continue;
+        }
+
+        const key = trimmedLine.substring(0, equalIndex).trim();
+        let value = trimmedLine.substring(equalIndex + 1).trim();
+
+        // Remove quotes if present
+        if ((value.startsWith('"') && value.endsWith('"')) ||
+            (value.startsWith("'") && value.endsWith("'")) ||
+            (value.startsWith("`") && value.endsWith("`"))) {
+            value = value.slice(1, -1);
+        }
+
+        variables[key] = value;
+    }
+
+    return variables;
+}
+
+function detectFileFormat(content: string): ParsedEnvironmentFile {
+    content = content.trim();
+
+    // Try to parse as JSON
+    try {
+        const jsonData = JSON.parse(content);
+
+        // Check if this is a direct variables object or a project structure
+        if (Array.isArray(jsonData)) {
+            // This is likely our full project structure - extract first project's variables
+            if (jsonData.length > 0 && jsonData[0].instances) {
+                // Find the first non-empty instance
+                const project = jsonData[0];
+                for (const instance of ['development', 'production', 'preview'] as const) {
+                    if (Object.keys(project.instances[instance] || {}).length > 0) {
+                        // This is encrypted data, return as is
+                        return {
+                            variables: project.instances[instance],
+                            format: 'encrypted-json'
+                        };
+                    }
+                }
+            }
+            return { variables: {}, format: 'unknown' };
+        }
+        else if (jsonData.instances) {
+            // Single project object
+            for (const instance of ['development', 'production', 'preview'] as const) {
+                if (Object.keys(jsonData.instances[instance] || {}).length > 0) {
+                    return {
+                        variables: jsonData.instances[instance],
+                        format: 'encrypted-json'
+                    };
+                }
+            }
+            return { variables: {}, format: 'unknown' };
+        }
+        else {
+            // Assume it's a plain key-value object
+            return {
+                variables: jsonData,
+                format: 'json'
+            };
+        }
+    } catch (e) {
+        // Not valid JSON, try as .env format
+        if (content.includes('=')) {
+            return {
+                variables: parseEnvFileContent(content),
+                format: 'env'
+            };
+        }
+    }
+
+    // Default case
+    return { variables: {}, format: 'unknown' };
+}
+
+// GitHub backup and sync functions
 async function backupToGitHub(context: vscode.ExtensionContext): Promise<void> {
-    const outputChannel = vscode.window.createOutputChannel('GitHub Operations');
-    outputChannel.show();
-    outputChannel.appendLine('Starting backup process...');
+    const channel = getOutputChannel();
+    channel.show();
+    channel.appendLine('Starting backup process...');
 
     try {
         await checkGitHubAuth();
@@ -116,38 +279,82 @@ async function backupToGitHub(context: vscode.ExtensionContext): Promise<void> {
         const storagePath = context.globalStorageUri.fsPath;
         const projectsFilePath = path.join(storagePath, 'projects.json');
 
-        const projects = JSON.parse(fs.readFileSync(projectsFilePath, 'utf8'));
-        fs.writeFileSync(projectsFilePath, JSON.stringify(projects, null, 2));
-
-        await execShellCommand(`cd ${storagePath} && git init`);
-
-        try {
-            await execShellCommand(`cd ${storagePath} && git remote get-url origin`);
-        } catch {
-            await execShellCommand(
-                `cd ${storagePath} && git remote add origin https://github.com/${username}/${repoName}.git`
-            );
+        if (!fs.existsSync(projectsFilePath)) {
+            throw new Error('No projects found to backup');
         }
 
-        await execShellCommand(`cd ${storagePath} && git add projects.json`);
-        await execShellCommand(
-            `cd ${storagePath} && git commit -m "Backup at ${new Date().toISOString()}"`
-        );
-        await execShellCommand(`cd ${storagePath} && git push -u origin master --force`);
+        const projects = JSON.parse(fs.readFileSync(projectsFilePath, 'utf8')) as EnvProject[];
 
-        outputChannel.appendLine('Backup completed successfully!');
-        vscode.window.showInformationMessage('Successfully backed up to GitHub');
+        // Update metadata for each project
+        projects.forEach((project: EnvProject) => {
+            if (!project.metadata) {
+                project.metadata = {
+                    created: new Date().toISOString(),
+                    lastModified: new Date().toISOString()
+                };
+            } else {
+                project.metadata.lastModified = new Date().toISOString();
+            }
+        });
+
+        fs.writeFileSync(projectsFilePath, JSON.stringify(projects, null, 2));
+
+        // Create a temporary directory for git operations
+        const tempDir = path.join(os.tmpdir(), `tryenv-${Math.random().toString(36).substring(2, 10)}`);
+        if (!fs.existsSync(tempDir)) {
+            fs.mkdirSync(tempDir, { recursive: true });
+        }
+
+        try {
+            // Copy the projects file to temp directory
+            fs.copyFileSync(projectsFilePath, path.join(tempDir, 'projects.json'));
+
+            // Initialize git repo in temp directory
+            await execShellCommand(`cd "${tempDir}" && git init`);
+
+            try {
+                await execShellCommand(`cd "${tempDir}" && git remote get-url origin`);
+            } catch {
+                await execShellCommand(
+                    `cd "${tempDir}" && git remote add origin https://github.com/${username}/${repoName}.git`
+                );
+            }
+
+            // Configure git
+            await execShellCommand(`cd "${tempDir}" && git config user.email "tryenv@example.com"`);
+            await execShellCommand(`cd "${tempDir}" && git config user.name "tryEnv Extension"`);
+
+            // Add, commit and push
+            await execShellCommand(`cd "${tempDir}" && git add projects.json`);
+            await execShellCommand(
+                `cd "${tempDir}" && git commit -m "Backup at ${new Date().toISOString()}"`
+            );
+            await execShellCommand(`cd "${tempDir}" && git push -u origin HEAD:master --force`);
+
+            // Cleanup
+            fs.rmSync(tempDir, { recursive: true, force: true });
+
+            channel.appendLine('Backup completed successfully!');
+            vscode.window.showInformationMessage('Successfully backed up to GitHub');
+        } catch (error) {
+            channel.appendLine(`Git operation failed: ${error}`);
+            // Cleanup on error
+            if (fs.existsSync(tempDir)) {
+                fs.rmSync(tempDir, { recursive: true, force: true });
+            }
+            throw error;
+        }
     } catch (error) {
-        outputChannel.appendLine(`Backup failed: ${(error as Error).message}`);
-        vscode.window.showErrorMessage(`Backup failed: ${(error as Error).message}`);
+        channel.appendLine(`Backup failed: ${error}`);
+        vscode.window.showErrorMessage(`Backup failed: ${error}`);
         throw error;
     }
 }
 
 async function syncFromGitHub(context: vscode.ExtensionContext): Promise<void> {
-    const outputChannel = vscode.window.createOutputChannel('GitHub Operations');
-    outputChannel.show();
-    outputChannel.appendLine('Starting sync process...');
+    const channel = getOutputChannel();
+    channel.show();
+    channel.appendLine('Starting sync process...');
 
     try {
         await checkGitHubAuth();
@@ -156,7 +363,7 @@ async function syncFromGitHub(context: vscode.ExtensionContext): Promise<void> {
         const username = await getGitHubUsername();
         const storagePath = context.globalStorageUri.fsPath;
         const projectsFilePath = path.join(storagePath, 'projects.json');
-        const tempDir = path.join(storagePath, 'temp_sync');
+        const tempDir = path.join(os.tmpdir(), `tryenv-sync-${Math.random().toString(36).substring(2, 10)}`);
 
         if (fs.existsSync(projectsFilePath)) {
             const localProjects = JSON.parse(fs.readFileSync(projectsFilePath, 'utf8'));
@@ -169,7 +376,7 @@ async function syncFromGitHub(context: vscode.ExtensionContext): Promise<void> {
                 );
 
                 if (decision === 'Cancel') {
-                    outputChannel.appendLine('Sync cancelled by user');
+                    channel.appendLine('Sync cancelled by user');
                     return;
                 }
                 if (decision === 'Backup First') {
@@ -183,9 +390,9 @@ async function syncFromGitHub(context: vscode.ExtensionContext): Promise<void> {
         }
         fs.mkdirSync(tempDir, { recursive: true });
 
-        outputChannel.appendLine('Cloning repository...');
+        channel.appendLine('Cloning repository...');
         await execShellCommand(
-            `cd ${tempDir} && git clone https://github.com/${username}/${repoName}.git`
+            `cd "${tempDir}" && git clone https://github.com/${username}/${repoName}.git`
         );
 
         const backupFilePath = path.join(tempDir, repoName, 'projects.json');
@@ -208,20 +415,21 @@ async function syncFromGitHub(context: vscode.ExtensionContext): Promise<void> {
 
             fs.rmSync(tempDir, { recursive: true, force: true });
 
-            outputChannel.appendLine('Sync completed successfully!');
+            channel.appendLine('Sync completed successfully!');
             vscode.window.showInformationMessage('Successfully synced from GitHub');
 
             return;
         } catch (error) {
-            throw new Error(`Failed to validate backup data: ${(error as Error).message}`);
+            throw new Error(`Failed to validate backup data: ${error}`);
         }
     } catch (error) {
-        outputChannel.appendLine(`Sync failed: ${(error as Error).message}`);
-        vscode.window.showErrorMessage(`Sync failed: ${(error as Error).message}`);
+        channel.appendLine(`Sync failed: ${error}`);
+        vscode.window.showErrorMessage(`Sync failed: ${error}`);
         throw error;
     }
 }
 
+// TreeItem class for project view
 class ProjectTreeItem extends vscode.TreeItem {
     constructor(
         public readonly label: string,
@@ -243,6 +451,7 @@ class ProjectTreeItem extends vscode.TreeItem {
     }
 }
 
+// Tree data provider for project explorer
 class ProjectTreeDataProvider implements vscode.TreeDataProvider<ProjectTreeItem> {
     private _onDidChangeTreeData: vscode.EventEmitter<ProjectTreeItem | undefined | null | void> =
         new vscode.EventEmitter<ProjectTreeItem | undefined | null | void>();
@@ -254,6 +463,10 @@ class ProjectTreeDataProvider implements vscode.TreeDataProvider<ProjectTreeItem
     }
 
     private _projects: EnvProject[] = [];
+
+    get projects(): EnvProject[] {
+        return this._projects;
+    }
 
     refresh(): void {
         this.loadProjects();
@@ -308,9 +521,130 @@ class ProjectTreeDataProvider implements vscode.TreeDataProvider<ProjectTreeItem
         }
         return Promise.resolve([]);
     }
+
+    // Save projects to disk
+    saveProjects(): void {
+        try {
+            fs.writeFileSync(this.projectsFilePath, JSON.stringify(this._projects, null, 2));
+        } catch (error) {
+            console.error('Error saving projects:', error);
+            vscode.window.showErrorMessage('Failed to save projects');
+        }
+    }
+
+    // Add a new project
+    addProject(project: EnvProject): void {
+        this._projects.push(project);
+        this.saveProjects();
+        this.refresh();
+    }
+
+    // Update an existing project
+    updateProject(projectId: string, updates: Partial<EnvProject>): void {
+        const projectIndex = this._projects.findIndex(p => p.id === projectId);
+        if (projectIndex !== -1) {
+            this._projects[projectIndex] = { ...this._projects[projectIndex], ...updates };
+            if (!this._projects[projectIndex].metadata) {
+                this._projects[projectIndex].metadata = {
+                    created: new Date().toISOString(),
+                    lastModified: new Date().toISOString()
+                };
+            } else {
+                this._projects[projectIndex].metadata.lastModified = new Date().toISOString();
+            }
+            this.saveProjects();
+            this.refresh();
+        }
+    }
+
+    // Delete a project
+    deleteProject(projectId: string): void {
+        this._projects = this._projects.filter(p => p.id !== projectId);
+        this.saveProjects();
+        this.refresh();
+    }
+
+    // Export project to file
+    async exportProject(projectId: string, instanceName: EnvInstance, format: 'env' | 'json'): Promise<void> {
+        const project = this._projects.find(p => p.id === projectId);
+        if (!project) {
+            throw new Error('Project not found');
+        }
+
+        const instance = project.instances[instanceName];
+
+        let content: string;
+        let fileExtension: string;
+
+        if (format === 'env') {
+            const decryptedVars: Record<string, string> = {};
+            for (const [key, encValue] of Object.entries(instance)) {
+                decryptedVars[key] = decrypt(encValue, project.id);
+            }
+            content = generateEnvFileContent(decryptedVars);
+            fileExtension = 'env';
+        } else {
+            content = JSON.stringify(instance, null, 2);
+            fileExtension = 'json';
+        }
+
+        const uri = await vscode.window.showSaveDialog({
+            defaultUri: vscode.Uri.file(`${project.name}-${instanceName}.${fileExtension}`),
+            filters: {
+                'All Files': ['*']
+            }
+        });
+
+        if (uri) {
+            fs.writeFileSync(uri.fsPath, content);
+            vscode.window.showInformationMessage(`Exported ${instanceName} variables to ${uri.fsPath}`);
+        }
+    }
+
+    // Import variables to a project instance
+    async importVariablesToInstance(
+        projectId: string,
+        instanceName: EnvInstance,
+        variables: Record<string, string | EncryptedData>,
+        isEncrypted: boolean
+    ): Promise<void> {
+        const projectIndex = this._projects.findIndex(p => p.id === projectId);
+        if (projectIndex === -1) {
+            throw new Error('Project not found');
+        }
+
+        // Get a reference to the target instance
+        const instance = this._projects[projectIndex].instances[instanceName];
+
+        // Process each variable
+        for (const [key, value] of Object.entries(variables)) {
+            if (isEncrypted && typeof value === 'object' && 'encrypted' in value && 'iv' in value && 'tag' in value && 'salt' in value) {
+                // Already encrypted, just copy it
+                instance[key] = value as EncryptedData;
+            } else if (!isEncrypted && typeof value === 'string') {
+                // Need to encrypt the value
+                instance[key] = encrypt(value, projectId);
+            }
+        }
+
+        // Update metadata
+        if (!this._projects[projectIndex].metadata) {
+            this._projects[projectIndex].metadata = {
+                created: new Date().toISOString(),
+                lastModified: new Date().toISOString()
+            };
+        } else {
+            this._projects[projectIndex].metadata.lastModified = new Date().toISOString();
+        }
+
+        this.saveProjects();
+        this.refresh();
+    }
 }
 
+// Main activation function
 export function activate(context: vscode.ExtensionContext) {
+    // Initialize storage
     const storagePath = context.globalStorageUri.fsPath;
     const projectsFilePath = path.join(storagePath, 'projects.json');
 
@@ -319,15 +653,16 @@ export function activate(context: vscode.ExtensionContext) {
     }
 
     if (!fs.existsSync(projectsFilePath)) {
-        fs.writeFileSync(projectsFilePath, JSON.stringify([]));
+        fs.writeFileSync(projectsFilePath, JSON.stringify([]), { encoding: 'utf8' });
     }
 
+    // Initialize tree view
     const treeDataProvider = new ProjectTreeDataProvider(projectsFilePath);
     vscode.window.registerTreeDataProvider('tryenvExplorer', treeDataProvider);
 
     let currentPanel: vscode.WebviewPanel | undefined = undefined;
 
-    // Register Sync Command
+    // Register commands
     context.subscriptions.push(
         vscode.commands.registerCommand('tryenv.syncFromGitHub', async () => {
             try {
@@ -335,19 +670,16 @@ export function activate(context: vscode.ExtensionContext) {
                 treeDataProvider.refresh();
             } catch (error) {
                 console.error('Sync failed:', error);
-                throw error;
             }
         })
     );
 
-    // Register Backup Command
     context.subscriptions.push(
         vscode.commands.registerCommand('tryenv.backupToGitHub', async () => {
             try {
                 await backupToGitHub(context);
             } catch (error) {
                 console.error('Backup failed:', error);
-                throw error;
             }
         })
     );
@@ -361,16 +693,10 @@ export function activate(context: vscode.ExtensionContext) {
             });
 
             if (newName) {
-                const projects = JSON.parse(fs.readFileSync(projectsFilePath, 'utf8'));
-                const projectToUpdate = projects.find((p: EnvProject) => p.id === item.projectId);
-                if (projectToUpdate) {
-                    projectToUpdate.name = newName;
-                    fs.writeFileSync(projectsFilePath, JSON.stringify(projects, null, 2));
-                    treeDataProvider.refresh();
+                treeDataProvider.updateProject(item.projectId, { name: newName });
 
-                    if (currentPanel && currentPanel.title.startsWith('TryEnv:')) {
-                        currentPanel.title = `TryEnv: ${newName}`;
-                    }
+                if (currentPanel && currentPanel.title.startsWith('TryEnv:')) {
+                    currentPanel.title = `TryEnv: ${newName}`;
                 }
             }
         })
@@ -385,10 +711,7 @@ export function activate(context: vscode.ExtensionContext) {
             );
 
             if (confirmation === 'Yes') {
-                const projects = JSON.parse(fs.readFileSync(projectsFilePath, 'utf8'));
-                const updatedProjects = projects.filter((p: EnvProject) => p.id !== item.projectId);
-                fs.writeFileSync(projectsFilePath, JSON.stringify(updatedProjects, null, 2));
-                treeDataProvider.refresh();
+                treeDataProvider.deleteProject(item.projectId);
 
                 if (currentPanel && currentPanel.title === `TryEnv: ${item.label}`) {
                     currentPanel.dispose();
@@ -397,37 +720,377 @@ export function activate(context: vscode.ExtensionContext) {
         })
     );
 
+    // Enhanced createProject command with import options
     context.subscriptions.push(
         vscode.commands.registerCommand('tryenv.createProject', async () => {
-            const projectName = await vscode.window.showInputBox({
-                prompt: 'Enter project name',
-                placeHolder: 'My Project'
+            const options = ['Create Empty Project', 'Import from File', 'Paste JSON'];
+            const choice = await vscode.window.showQuickPick(options, {
+                placeHolder: 'How would you like to create your project?'
             });
 
-            if (projectName) {
-                const newProject: EnvProject = {
-                    id: uuidv4(),
-                    name: projectName,
-                    instances: {
-                        preview: {},
-                        development: {},
-                        production: {}
-                    }
-                };
+            if (!choice) {
+                return;
+            }
 
-                const projects = JSON.parse(fs.readFileSync(projectsFilePath, 'utf8'));
-                projects.push(newProject);
-                fs.writeFileSync(projectsFilePath, JSON.stringify(projects, null, 2));
-                treeDataProvider.refresh();
+            if (choice === 'Create Empty Project') {
+                // Original create project flow
+                const projectName = await vscode.window.showInputBox({
+                    prompt: 'Enter project name',
+                    placeHolder: 'My Project'
+                });
+
+                if (projectName) {
+                    const newProject: EnvProject = {
+                        id: uuidv4(),
+                        name: projectName,
+                        instances: {
+                            preview: {},
+                            development: {},
+                            production: {}
+                        },
+                        metadata: {
+                            created: new Date().toISOString(),
+                            lastModified: new Date().toISOString()
+                        }
+                    };
+
+                    treeDataProvider.addProject(newProject);
+                }
+            } else if (choice === 'Import from File') {
+                // Handle import from file
+                const fileUris = await vscode.window.showOpenDialog({
+                    canSelectFiles: true,
+                    canSelectFolders: false,
+                    canSelectMany: false,
+                    filters: {
+                        'JSON Files': ['json'],
+                        'Environment Files': ['env'],
+                        'All Files': ['*']
+                    },
+                    title: 'Select a file to import'
+                });
+
+                if (fileUris && fileUris.length > 0) {
+                    try {
+                        const fileContent = fs.readFileSync(fileUris[0].fsPath, 'utf8');
+
+                        // Check if this is our full project format
+                        try {
+                            const jsonData = JSON.parse(fileContent);
+
+                            // If it's an array of projects
+                            if (Array.isArray(jsonData) && jsonData.length > 0 && jsonData[0].id && jsonData[0].instances) {
+                                // This is our full project format
+                                for (const project of jsonData) {
+                                    // Ensure the project has a new unique ID to avoid conflicts
+                                    const existingProject = treeDataProvider.projects.find(p => p.id === project.id);
+                                    if (existingProject) {
+                                        // Ask for conflict resolution
+                                        const action = await vscode.window.showQuickPick(
+                                            ['Skip', 'Rename', 'Overwrite'],
+                                            {
+                                                placeHolder: `Project '${project.name}' already exists. What would you like to do?`
+                                            }
+                                        );
+
+                                        if (action === 'Skip') {
+                                            continue;
+                                        } else if (action === 'Rename') {
+                                            const newName = await vscode.window.showInputBox({
+                                                prompt: 'Enter new project name',
+                                                value: `${project.name} (imported)`
+                                            });
+
+                                            if (newName) {
+                                                const newProject = {
+                                                    ...project,
+                                                    id: uuidv4(),
+                                                    name: newName
+                                                };
+                                                treeDataProvider.addProject(newProject);
+                                            }
+                                        } else if (action === 'Overwrite') {
+                                            treeDataProvider.updateProject(project.id, project);
+                                        }
+                                    } else {
+                                        // Just add the project
+                                        treeDataProvider.addProject(project);
+                                    }
+                                }
+
+                                vscode.window.showInformationMessage('Projects imported successfully');
+                                return;
+                            }
+                            // If it's a single project
+                            else if (jsonData.id && jsonData.instances) {
+                                // Check for existing project
+                                const existingProject = treeDataProvider.projects.find(p => p.id === jsonData.id);
+                                if (existingProject) {
+                                    const action = await vscode.window.showQuickPick(
+                                        ['Rename', 'Overwrite', 'Cancel'],
+                                        {
+                                            placeHolder: `Project '${jsonData.name}' already exists. What would you like to do?`
+                                        }
+                                    );
+
+                                    if (action === 'Cancel') {
+                                        return;
+                                    } else if (action === 'Rename') {
+                                        const newName = await vscode.window.showInputBox({
+                                            prompt: 'Enter new project name',
+                                            value: `${jsonData.name} (imported)`
+                                        });
+
+                                        if (newName) {
+                                            const newProject = {
+                                                ...jsonData,
+                                                id: uuidv4(),
+                                                name: newName
+                                            };
+                                            treeDataProvider.addProject(newProject);
+                                        }
+                                    } else if (action === 'Overwrite') {
+                                        treeDataProvider.updateProject(jsonData.id, jsonData);
+                                    }
+                                } else {
+                                    treeDataProvider.addProject(jsonData);
+                                }
+
+                                vscode.window.showInformationMessage('Project imported successfully');
+                                return;
+                            }
+                        } catch (e) {
+                            // Not a valid full project JSON, continue with environment variable import
+                        }
+
+                        // Handle as environment variables
+                        const parsedFile = detectFileFormat(fileContent);
+
+                        if (parsedFile.format === 'unknown' || Object.keys(parsedFile.variables).length === 0) {
+                            throw new Error('Could not parse file or no variables found');
+                        }
+
+                        // Ask for project name and instance
+                        const projectName = await vscode.window.showInputBox({
+                            prompt: 'Enter project name',
+                            placeHolder: 'My Project'
+                        });
+
+                        if (!projectName) {
+                            return;
+                        }
+
+                        const instanceName = await vscode.window.showQuickPick(
+                            ['preview', 'development', 'production'],
+                            {
+                                placeHolder: 'Select the environment instance'
+                            }
+                        ) as EnvInstance | undefined;
+
+                        if (!instanceName) {
+                            return;
+                        }
+
+                        // Create new project
+                        const newProjectId = uuidv4();
+                        const newProject: EnvProject = {
+                            id: newProjectId,
+                            name: projectName,
+                            instances: {
+                                preview: {},
+                                development: {},
+                                production: {}
+                            },
+                            metadata: {
+                                created: new Date().toISOString(),
+                                lastModified: new Date().toISOString()
+                            }
+                        };
+
+                        treeDataProvider.addProject(newProject);
+
+                        // Import variables
+                        const isEncrypted = parsedFile.format === 'encrypted-json';
+                        await treeDataProvider.importVariablesToInstance(
+                            newProjectId,
+                            instanceName,
+                            parsedFile.variables,
+                            isEncrypted
+                        );
+
+                        vscode.window.showInformationMessage('Project created and variables imported successfully');
+                    } catch (error) {
+                        vscode.window.showErrorMessage(`Error importing project: ${error}`);
+                    }
+                }
+            } else if (choice === 'Paste JSON') {
+                // Handle paste JSON
+                const jsonContent = await vscode.window.showInputBox({
+                    prompt: 'Paste your JSON project data',
+                    placeHolder: '{"name": "My Project", ...}',
+                    value: ''
+                });
+
+                if (jsonContent) {
+                    try {
+                        // Try to parse as full project format first
+                        try {
+                            const jsonData = JSON.parse(jsonContent);
+
+                            // If it's an array of projects
+                            if (Array.isArray(jsonData) && jsonData.length > 0 && jsonData[0].id && jsonData[0].instances) {
+                                // This is our full project format
+                                for (const project of jsonData) {
+                                    // Check for existing project
+                                    const existingProject = treeDataProvider.projects.find(p => p.id === project.id);
+                                    if (existingProject) {
+                                        const action = await vscode.window.showQuickPick(
+                                            ['Skip', 'Rename', 'Overwrite'],
+                                            {
+                                                placeHolder: `Project '${project.name}' already exists. What would you like to do?`
+                                            }
+                                        );
+
+                                        if (action === 'Skip') {
+                                            continue;
+                                        } else if (action === 'Rename') {
+                                            const newName = await vscode.window.showInputBox({
+                                                prompt: 'Enter new project name',
+                                                value: `${project.name} (imported)`
+                                            });
+
+                                            if (newName) {
+                                                const newProject = {
+                                                    ...project,
+                                                    id: uuidv4(),
+                                                    name: newName
+                                                };
+                                                treeDataProvider.addProject(newProject);
+                                            }
+                                        } else if (action === 'Overwrite') {
+                                            treeDataProvider.updateProject(project.id, project);
+                                        }
+                                    } else {
+                                        // Just add the project
+                                        treeDataProvider.addProject(project);
+                                    }
+                                }
+
+                                vscode.window.showInformationMessage('Projects imported successfully');
+                                return;
+                            }
+                            // If it's a single project
+                            else if (jsonData.id && jsonData.instances) {
+                                // Check for existing project
+                                const existingProject = treeDataProvider.projects.find(p => p.id === jsonData.id);
+                                if (existingProject) {
+                                    const action = await vscode.window.showQuickPick(
+                                        ['Rename', 'Overwrite', 'Cancel'],
+                                        {
+                                            placeHolder: `Project '${jsonData.name}' already exists. What would you like to do?`
+                                        }
+                                    );
+
+                                    if (action === 'Cancel') {
+                                        return;
+                                    } else if (action === 'Rename') {
+                                        const newName = await vscode.window.showInputBox({
+                                            prompt: 'Enter new project name',
+                                            value: `${jsonData.name} (imported)`
+                                        });
+
+                                        if (newName) {
+                                            const newProject = {
+                                                ...jsonData,
+                                                id: uuidv4(),
+                                                name: newName
+                                            };
+                                            treeDataProvider.addProject(newProject);
+                                        }
+                                    } else if (action === 'Overwrite') {
+                                        treeDataProvider.updateProject(jsonData.id, jsonData);
+                                    }
+                                } else {
+                                    treeDataProvider.addProject(jsonData);
+                                }
+
+                                vscode.window.showInformationMessage('Project imported successfully');
+                                return;
+                            }
+                        } catch (e) {
+                            // Not a valid full project JSON, continue with environment variable import
+                        }
+
+                        // Handle as environment variables
+                        const parsedData = detectFileFormat(jsonContent);
+
+                        if (parsedData.format === 'unknown' || Object.keys(parsedData.variables).length === 0) {
+                            throw new Error('Could not parse JSON or no variables found');
+                        }
+
+                        // Ask for project name and instance
+                        const projectName = await vscode.window.showInputBox({
+                            prompt: 'Enter project name',
+                            placeHolder: 'My Project'
+                        });
+
+                        if (!projectName) {
+                            return;
+                        }
+
+                        const instanceName = await vscode.window.showQuickPick(
+                            ['preview', 'development', 'production'],
+                            {
+                                placeHolder: 'Select the environment instance'
+                            }
+                        ) as EnvInstance | undefined;
+
+                        if (!instanceName) {
+                            return;
+                        }
+
+                        // Create new project
+                        const newProjectId = uuidv4();
+                        const newProject: EnvProject = {
+                            id: newProjectId,
+                            name: projectName,
+                            instances: {
+                                preview: {},
+                                development: {},
+                                production: {}
+                            },
+                            metadata: {
+                                created: new Date().toISOString(),
+                                lastModified: new Date().toISOString()
+                            }
+                        };
+
+                        treeDataProvider.addProject(newProject);
+
+                        // Import variables
+                        const isEncrypted = parsedData.format === 'encrypted-json';
+                        await treeDataProvider.importVariablesToInstance(
+                            newProjectId,
+                            instanceName,
+                            parsedData.variables,
+                            isEncrypted
+                        );
+
+                        vscode.window.showInformationMessage('Project created and variables imported successfully');
+                    } catch (error) {
+                        vscode.window.showErrorMessage(`Error importing project: ${error}`);
+                    }
+                }
             }
         })
     );
 
+    // Enhanced openProject command with copy/export
     context.subscriptions.push(
         vscode.commands.registerCommand('tryenv.openProject', (project: EnvProject, instance?: string) => {
             if (currentPanel) {
                 currentPanel.reveal(vscode.ViewColumn.One);
-                updateProjectPanel(currentPanel, project, context.extensionUri, instance);
+                updateProjectPanel(currentPanel, project, context.extensionUri, instance, treeDataProvider);
             } else {
                 currentPanel = vscode.window.createWebviewPanel(
                     'tryenvProject',
@@ -440,7 +1103,7 @@ export function activate(context: vscode.ExtensionContext) {
                     }
                 );
 
-                updateProjectPanel(currentPanel, project, context.extensionUri, instance);
+                updateProjectPanel(currentPanel, project, context.extensionUri, instance, treeDataProvider);
 
                 currentPanel.onDidDispose(
                     () => {
@@ -450,53 +1113,166 @@ export function activate(context: vscode.ExtensionContext) {
                     context.subscriptions
                 );
 
+                // Handle messages from the webview
                 currentPanel.webview.onDidReceiveMessage(
                     async message => {
-                        const projects = JSON.parse(fs.readFileSync(projectsFilePath, 'utf8'));
-                        const projectToUpdate = projects.find((p: EnvProject) => p.id === message.projectId);
-
+                        const projectToUpdate = treeDataProvider.projects.find(p => p.id === message.projectId);
                         if (!projectToUpdate) { return; }
+
+                        const instance = message.instance as EnvInstance;
 
                         switch (message.type) {
                             case 'addVariable':
                                 if (message.key && message.value) {
-                                    projectToUpdate.instances[message.instance][message.key] = encrypt(
+                                    projectToUpdate.instances[instance][message.key] = encrypt(
                                         message.value,
                                         projectToUpdate.id
                                     );
+                                    if (projectToUpdate.metadata) {
+                                        projectToUpdate.metadata.lastModified = new Date().toISOString();
+                                    }
+                                    treeDataProvider.updateProject(projectToUpdate.id, projectToUpdate);
                                 }
                                 break;
+
                             case 'editVariable':
                                 const newValue = await vscode.window.showInputBox({
                                     prompt: `Edit value for ${message.key}`,
                                     value: decrypt(
-                                        projectToUpdate.instances[message.instance][message.key],
+                                        projectToUpdate.instances[instance][message.key],
                                         projectToUpdate.id
                                     )
                                 });
                                 if (newValue !== undefined) {
-                                    projectToUpdate.instances[message.instance][message.key] = encrypt(
+                                    projectToUpdate.instances[instance][message.key] = encrypt(
                                         newValue,
                                         projectToUpdate.id
                                     );
+                                    if (projectToUpdate.metadata) {
+                                        projectToUpdate.metadata.lastModified = new Date().toISOString();
+                                    }
+                                    treeDataProvider.updateProject(projectToUpdate.id, projectToUpdate);
                                 }
                                 break;
+
                             case 'deleteVariable':
-                                delete projectToUpdate.instances[message.instance][message.key];
+                                delete projectToUpdate.instances[instance][message.key];
+                                if (projectToUpdate.metadata) {
+                                    projectToUpdate.metadata.lastModified = new Date().toISOString();
+                                }
+                                treeDataProvider.updateProject(projectToUpdate.id, projectToUpdate);
                                 break;
+
                             case 'addMultipleVariables':
                                 for (const variable of message.variables) {
-                                    projectToUpdate.instances[message.instance][variable.key] = encrypt(
+                                    projectToUpdate.instances[instance][variable.key] = encrypt(
                                         variable.value,
                                         projectToUpdate.id
                                     );
                                 }
+                                if (projectToUpdate.metadata) {
+                                    projectToUpdate.metadata.lastModified = new Date().toISOString();
+                                }
+                                treeDataProvider.updateProject(projectToUpdate.id, projectToUpdate);
+                                break;
+
+                            case 'copyAsEnv':
+                                // Handle copy as .env file
+                                const envVars: Record<string, string> = {};
+                                Object.entries(projectToUpdate.instances[instance]).forEach(([key, encValue]) => {
+                                    envVars[key] = decrypt(encValue as EncryptedData, projectToUpdate.id);
+                                });
+
+                                await vscode.env.clipboard.writeText(generateEnvFileContent(envVars));
+                                vscode.window.showInformationMessage('Variables copied as .env format');
+                                break;
+
+                            case 'copyAsJson':
+                                // Handle copy as encrypted JSON
+                                await vscode.env.clipboard.writeText(
+                                    JSON.stringify(projectToUpdate.instances[instance], null, 2)
+                                );
+                                vscode.window.showInformationMessage('Variables copied as encrypted JSON');
+                                break;
+
+                            case 'exportAsFile':
+                                // Handle export to file
+                                try {
+                                    await treeDataProvider.exportProject(
+                                        projectToUpdate.id,
+                                        instance,
+                                        message.format === 'env' ? 'env' : 'json'
+                                    );
+                                } catch (error) {
+                                    vscode.window.showErrorMessage(`Export failed: ${error}`);
+                                }
+                                break;
+
+                            case 'importFromFile':
+                                // Handle file import
+                                const fileUris = await vscode.window.showOpenDialog({
+                                    canSelectFiles: true,
+                                    canSelectFolders: false,
+                                    canSelectMany: false,
+                                    filters: {
+                                        'JSON Files': ['json'],
+                                        'Environment Files': ['env'],
+                                        'All Files': ['*']
+                                    },
+                                    title: 'Select a file to import'
+                                });
+
+                                if (fileUris && fileUris.length > 0) {
+                                    try {
+                                        const fileContent = fs.readFileSync(fileUris[0].fsPath, 'utf8');
+                                        const parsedFile = detectFileFormat(fileContent);
+
+                                        if (parsedFile.format === 'unknown' || Object.keys(parsedFile.variables).length === 0) {
+                                            throw new Error('Could not parse file or no variables found');
+                                        }
+
+                                        // Ask how to handle existing variables
+                                        const action = await vscode.window.showQuickPick(
+                                            ['Merge (overwrite conflicts)', 'Replace all', 'Cancel'],
+                                            {
+                                                placeHolder: 'How would you like to handle existing variables?'
+                                            }
+                                        );
+
+                                        if (action === 'Cancel') {
+                                            return;
+                                        }
+
+                                        if (action === 'Replace all') {
+                                            // Clear existing variables
+                                            projectToUpdate.instances[instance] = {};
+                                        }
+
+                                        // Import variables
+                                        const isEncrypted = parsedFile.format === 'encrypted-json';
+                                        await treeDataProvider.importVariablesToInstance(
+                                            projectToUpdate.id,
+                                            instance,
+                                            parsedFile.variables,
+                                            isEncrypted
+                                        );
+
+                                        vscode.window.showInformationMessage('Variables imported successfully');
+
+                                        // Update panel
+                                        updateProjectPanel(currentPanel!, projectToUpdate, context.extensionUri, instance, treeDataProvider);
+                                    } catch (error) {
+                                        vscode.window.showErrorMessage(`Error importing variables: ${error}`);
+                                    }
+                                }
                                 break;
                         }
 
-                        fs.writeFileSync(projectsFilePath, JSON.stringify(projects, null, 2));
+                        // Refresh tree view
                         treeDataProvider.refresh();
-                        updateProjectPanel(currentPanel!, projectToUpdate, context.extensionUri, message.instance);
+
+                        // Update panel with latest data
+                        updateProjectPanel(currentPanel!, projectToUpdate, context.extensionUri, instance, treeDataProvider);
                     },
                     undefined,
                     context.subscriptions
@@ -504,13 +1280,73 @@ export function activate(context: vscode.ExtensionContext) {
             }
         })
     );
+
+    // Export project command
+    context.subscriptions.push(
+        vscode.commands.registerCommand('tryenv.exportProject', async (item: ProjectTreeItem) => {
+            if (item.type === 'project') {
+                const project = treeDataProvider.projects.find(p => p.id === item.projectId);
+                if (!project) {
+                    vscode.window.showErrorMessage('Project not found');
+                    return;
+                }
+
+                // Export entire project
+                const uri = await vscode.window.showSaveDialog({
+                    defaultUri: vscode.Uri.file(`${project.name}.json`),
+                    filters: {
+                        'JSON Files': ['json']
+                    },
+                    title: 'Export Project'
+                });
+
+                if (uri) {
+                    try {
+                        fs.writeFileSync(uri.fsPath, JSON.stringify(project, null, 2));
+                        vscode.window.showInformationMessage(`Project exported to ${uri.fsPath}`);
+                    } catch (error) {
+                        vscode.window.showErrorMessage(`Error exporting project: ${error}`);
+                    }
+                }
+            } else if (item.type === 'instance' && item.instance) {
+                const project = treeDataProvider.projects.find(p => p.id === item.projectId);
+                if (!project) {
+                    vscode.window.showErrorMessage('Project not found');
+                    return;
+                }
+
+                const format = await vscode.window.showQuickPick(
+                    ['JSON (encrypted)', 'Env (decrypted)'],
+                    {
+                        placeHolder: 'Select export format'
+                    }
+                );
+
+                if (!format) {
+                    return;
+                }
+
+                try {
+                    await treeDataProvider.exportProject(
+                        item.projectId,
+                        item.instance as EnvInstance,
+                        format === 'Env (decrypted)' ? 'env' : 'json'
+                    );
+                } catch (error) {
+                    vscode.window.showErrorMessage(`Export failed: ${error}`);
+                }
+            }
+        })
+    );
 }
 
+// Function to create HTML for webview
 function updateProjectPanel(
     panel: vscode.WebviewPanel,
     project: EnvProject,
     extensionUri: vscode.Uri,
-    activeInstance?: string
+    activeInstance?: string,
+    treeDataProvider?: ProjectTreeDataProvider
 ) {
     const instances = activeInstance ? [activeInstance] : ['preview', 'development', 'production'];
 
@@ -519,17 +1355,22 @@ function updateProjectPanel(
 <!DOCTYPE html>
 <html>
 <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <style>
         :root {
             --input-padding: 4px 8px;
             --border-radius: 4px;
             --button-padding: 6px 12px;
+            --font-size: 13px;
+            --small-font-size: 12px;
         }
 
         body {
             padding: 0;
             color: var(--vscode-foreground);
             font-family: var(--vscode-font-family);
+            font-size: var(--font-size);
             margin: 0;
             width: 100vw;
             height: 100vh;
@@ -552,6 +1393,35 @@ function updateProjectPanel(
             margin-bottom: 16px;
             padding: 0 16px;
             color: var(--vscode-foreground);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        @media (max-width: 768px) {
+            .section-title {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 10px;
+            }
+            
+            .export-actions {
+                width: 100%;
+                justify-content: flex-start;
+            }
+        }
+
+        .export-actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .export-actions button {
+            font-size: var(--small-font-size);
+            padding: 4px 8px;
+            white-space: nowrap;
         }
 
         .data-grid-container {
@@ -562,7 +1432,7 @@ function updateProjectPanel(
 
         .data-grid {
             display: grid;
-            grid-template-columns: minmax(250px, 2fr) minmax(350px, 3fr) minmax(200px, 1fr);
+            grid-template-columns: minmax(200px, 1fr) minmax(300px, 2fr) minmax(150px, 0.8fr);
             gap: 1px;
             width: 100%;
             background-color: var(--vscode-panel-border);
@@ -590,12 +1460,19 @@ function updateProjectPanel(
             min-height: 40px;
             display: flex;
             align-items: center;
+            word-break: break-word;
+        }
+
+        .variable-key {
+            font-weight: 500;
+            font-family: var(--vscode-editor-font-family);
         }
 
         .button-container {
             display: flex;
             gap: 8px;
             justify-content: flex-end;
+            flex-wrap: wrap;
         }
 
         .input-row {
@@ -614,7 +1491,7 @@ function updateProjectPanel(
             color: var(--vscode-badge-foreground);
             padding: 4px 8px;
             border-radius: 4px;
-            font-size: 12px;
+            font-size: var(--small-font-size);
         }
 
         .bulk-input-section {
@@ -629,6 +1506,23 @@ function updateProjectPanel(
             margin-top: 0;
             margin-bottom: 16px;
             color: var(--vscode-foreground);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        @media (max-width: 768px) {
+            .bulk-input-section h3 {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 10px;
+            }
+            
+            .import-export-section {
+                width: 100%;
+                justify-content: flex-start;
+            }
         }
 
         /* Custom Tab Styling */
@@ -636,6 +1530,14 @@ function updateProjectPanel(
             display: flex;
             border-bottom: 1px solid var(--vscode-panel-border);
             margin-bottom: 20px;
+            overflow-x: auto;
+            white-space: nowrap;
+            -ms-overflow-style: none;  /* Hide scrollbar in IE and Edge */
+            scrollbar-width: none;  /* Hide scrollbar in Firefox */
+        }
+
+        .tabs::-webkit-scrollbar {
+            display: none;  /* Hide scrollbar in Chrome and Safari */
         }
 
         .tab {
@@ -646,6 +1548,7 @@ function updateProjectPanel(
             color: var(--vscode-foreground);
             opacity: 0.7;
             transition: opacity 0.2s;
+            font-size: var(--font-size);
         }
 
         .tab.active {
@@ -674,6 +1577,7 @@ function updateProjectPanel(
             border-radius: var(--border-radius);
             width: 100%;
             font-family: var(--vscode-font-family);
+            font-size: var(--font-size);
             box-sizing: border-box;
         }
 
@@ -685,6 +1589,7 @@ function updateProjectPanel(
         textarea {
             min-height: 120px;
             resize: vertical;
+            font-family: var(--vscode-editor-font-family);
         }
 
         button {
@@ -695,6 +1600,7 @@ function updateProjectPanel(
             border-radius: var(--border-radius);
             cursor: pointer;
             font-family: var(--vscode-font-family);
+            font-size: var(--font-size);
             transition: background-color 0.2s;
         }
 
@@ -714,6 +1620,111 @@ function updateProjectPanel(
         .value-cell {
             font-family: var(--vscode-editor-font-family);
             word-break: break-all;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            line-height: 1.5;
+        }
+        
+        /* Import/Export section */
+        .import-export-section {
+            display: flex;
+            gap: 8px;
+            justify-content: flex-end;
+            flex-wrap: wrap;
+        }
+
+        /* Tooltip styles */
+        .tooltip {
+            position: relative;
+            display: inline-block;
+        }
+
+        .tooltip .tooltiptext {
+            visibility: hidden;
+            width: 120px;
+            background-color: var(--vscode-editorHoverWidget-background);
+            color: var(--vscode-editorHoverWidget-foreground);
+            text-align: center;
+            border-radius: 4px;
+            padding: 5px;
+            position: absolute;
+            z-index: 1;
+            bottom: 125%;
+            left: 50%;
+            margin-left: -60px;
+            opacity: 0;
+            transition: opacity 0.3s;
+            font-size: var(--small-font-size);
+        }
+
+        .tooltip .tooltiptext::after {
+            content: "";
+            position: absolute;
+            top: 100%;
+            left: 50%;
+            margin-left: -5px;
+            border-width: 5px;
+            border-style: solid;
+            border-color: var(--vscode-editorHoverWidget-background) transparent transparent transparent;
+        }
+
+        .tooltip:hover .tooltiptext {
+            visibility: visible;
+            opacity: 1;
+        }
+
+        /* Status indicator */
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-top: 10px;
+            opacity: 0.7;
+            font-size: var(--small-font-size);
+        }
+
+        .status-indicator .dot {
+            height: 8px;
+            width: 8px;
+            border-radius: 50%;
+            background-color: var(--vscode-terminal-ansiGreen);
+        }
+
+        /* Responsive adjustments */
+        @media (max-width: 600px) {
+            .data-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .grid-header:not(:first-child),
+            .grid-cell:not(:first-child) {
+                border-top: 1px solid var(--vscode-panel-border);
+            }
+            
+            .grid-cell .button-container {
+                justify-content: flex-start;
+                margin-top: 8px;
+            }
+        }
+        
+        /* Scrollbar customization */
+        ::-webkit-scrollbar {
+            width: 10px;
+            height: 10px;
+        }
+        
+        ::-webkit-scrollbar-track {
+            background: var(--vscode-scrollbarSlider-background);
+        }
+        
+        ::-webkit-scrollbar-thumb {
+            background: var(--vscode-scrollbarSlider-hoverBackground);
+            border-radius: 5px;
+        }
+        
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--vscode-scrollbarSlider-activeBackground);
         }
     </style>
 </head>
@@ -722,18 +1733,34 @@ function updateProjectPanel(
         <div class="tabs">
             ${instances.map((instance, index) => `
                 <button class="tab ${index === 0 ? 'active' : ''}" 
-                        onclick="switchTab('${instance}')">${
-                        instance.charAt(0).toUpperCase() + instance.slice(1)
-                        }</button>
+                        onclick="switchTab('${instance}')">${instance.charAt(0).toUpperCase() + instance.slice(1)
+        }</button>
             `).join('')}
         </div>
 
         ${instances.map((instance, index) => `
         <div class="tab-content ${index === 0 ? 'active' : ''}" id="content-${instance}">
             <div class="section">
-                <h2 class="section-title">${
-                    instance.charAt(0).toUpperCase() + instance.slice(1)
-                } Environment Variables</h2>
+                <h2 class="section-title">
+                    ${instance.charAt(0).toUpperCase() + instance.slice(1)} Environment Variables
+                    <div class="export-actions">
+                        <button class="secondary" onclick="copyAsEnv('${instance}', '${project.id}')">
+                            Copy as .env
+                        </button>
+                        <button class="secondary" onclick="copyAsJson('${instance}', '${project.id}')">
+                            Copy as JSON
+                        </button>
+                        <button class="secondary" onclick="exportAsFile('${instance}', '${project.id}', 'env')">
+                            Export as .env
+                        </button>
+                        <button class="secondary" onclick="exportAsFile('${instance}', '${project.id}', 'json')">
+                            Export as JSON
+                        </button>
+                        <button class="secondary" onclick="importFromFile('${instance}', '${project.id}')">
+                            Import Variables
+                        </button>
+                    </div>
+                </h2>
 
                 <div class="data-grid-container">
                     <div class="data-grid">
@@ -760,15 +1787,19 @@ function updateProjectPanel(
                         </div>
 
                         ${Object.entries(project.instances[instance as keyof typeof project.instances]).length > 0 ?
-                            Object.entries(project.instances[instance as keyof typeof project.instances])
-                                .map(([key, encryptedValue]) => {
-                                    const decryptedValue = decrypt(encryptedValue, project.id);
-                                    return `
+                Object.entries(project.instances[instance as keyof typeof project.instances])
+                    .map(([key, encryptedValue]) => {
+                        const decryptedValue = decrypt(encryptedValue as EncryptedData, project.id);
+                        return `
                                     <div class="grid-row">
-                                        <div class="grid-cell">${key}</div>
+                                        <div class="grid-cell variable-key">${key}</div>
                                         <div class="grid-cell value-cell">${decryptedValue}</div>
                                         <div class="grid-cell">
                                             <div class="button-container">
+                                                <button class="secondary" 
+                                                        onclick="copyVariableValue('${instance}', '${project.id}', '${key}')">
+                                                    Copy Value
+                                                </button>
                                                 <button class="secondary" 
                                                         onclick="editVariable('${instance}', '${project.id}', '${key}')">
                                                     Edit
@@ -781,23 +1812,36 @@ function updateProjectPanel(
                                         </div>
                                     </div>
                                     `;
-                                }).join('')
-                            : `
+                    }).join('')
+                : `
                             <div class="empty-state">
-                                <span class="badge">No variables defined yet. Add one above.</span>
+                                <span class="badge">No variables defined yet. Add one above or import.</span>
                             </div>
                             `
-                        }
+            }
                     </div>
                 </div>
 
                 <div class="bulk-input-section">
-                    <h3>Bulk Add Variables</h3>
+                    <h3>
+                        Bulk Add Variables
+                        <div class="import-export-section">
+                            <input type="file" id="file-input-${instance}" style="display:none" 
+                                  onchange="handleFileUpload('${instance}', '${project.id}', this)">
+                            <button class="secondary" onclick="document.getElementById('file-input-${instance}').click()">
+                                Upload File
+                            </button>
+                        </div>
+                    </h3>
                     <textarea id="paste-area-${instance}" 
-                              placeholder="Paste your environment variables here (e.g., KEY=value or KEY='value')"></textarea>
+                              placeholder="Paste your environment variables here in .env format (KEY=value) or JSON format"></textarea>
                     <button onclick="handlePaste('${instance}', '${project.id}')">
                         Add Variables
                     </button>
+                    <div class="status-indicator">
+                        <div class="dot"></div>
+                        <span>Changes are saved automatically</span>
+                    </div>
                 </div>
             </div>
         </div>
@@ -806,6 +1850,44 @@ function updateProjectPanel(
 
     <script>
         const vscode = acquireVsCodeApi();
+        
+        // Initialize notification system for copy actions
+        let copyNotificationTimeout;
+        
+        function showCopyNotification(message) {
+            // Clear any existing notification
+            if (copyNotificationTimeout) {
+                clearTimeout(copyNotificationTimeout);
+            }
+            
+            // Create or get notification element
+            let notification = document.getElementById('copy-notification');
+            if (!notification) {
+                notification = document.createElement('div');
+                notification.id = 'copy-notification';
+                notification.style.position = 'fixed';
+                notification.style.bottom = '20px';
+                notification.style.right = '20px';
+                notification.style.padding = '10px 15px';
+                notification.style.backgroundColor = 'var(--vscode-notificationToast-background)';
+                notification.style.color = 'var(--vscode-notificationToast-foreground)';
+                notification.style.borderRadius = '4px';
+                notification.style.zIndex = '1000';
+                notification.style.boxShadow = '0 2px 8px rgba(0, 0, 0, 0.15)';
+                notification.style.opacity = '0';
+                notification.style.transition = 'opacity 0.3s ease-in-out';
+                document.body.appendChild(notification);
+            }
+            
+            // Show notification with message
+            notification.textContent = message;
+            notification.style.opacity = '1';
+            
+            // Hide after 3 seconds
+            copyNotificationTimeout = setTimeout(() => {
+                notification.style.opacity = '0';
+            }, 3000);
+        }
 
         function switchTab(instanceId) {
             // Hide all content
@@ -820,7 +1902,7 @@ function updateProjectPanel(
             
             // Show selected content and activate tab
             document.getElementById('content-' + instanceId).classList.add('active');
-            document.querySelector(\`.tab[onclick="switchTab('\${instanceId}')"]\`).classList.add('active');
+            document.querySelector('.tab[onclick="switchTab(\\'' + instanceId + '\\')"]').classList.add('active');
         }
 
         function addVariable(instance, projectId) {
@@ -841,6 +1923,10 @@ function updateProjectPanel(
 
                 keyInput.value = '';
                 valueInput.value = '';
+            } else if (!key) {
+                keyInput.focus();
+            } else {
+                valueInput.focus();
             }
         }
 
@@ -861,6 +1947,79 @@ function updateProjectPanel(
                 key: key
             });
         }
+        
+        function copyVariableValue(instance, projectId, key) {
+            // Find the value cell for this variable
+            const row = Array.from(document.querySelectorAll('.grid-row')).find(row => {
+                const keyCell = row.querySelector('.variable-key');
+                return keyCell && keyCell.textContent === key;
+            });
+            
+            if (row) {
+                const valueCell = row.querySelector('.value-cell');
+                if (valueCell) {
+                    // Copy the value to clipboard
+                    navigator.clipboard.writeText(valueCell.textContent)
+                        .then(() => {
+                            showCopyNotification('Copied value for ' + key);
+                        })
+                        .catch(err => {
+                            console.error('Failed to copy: ', err);
+                        });
+                }
+            }
+        }
+
+        function copyAsEnv(instance, projectId) {
+            vscode.postMessage({
+                type: 'copyAsEnv',
+                instance: instance,
+                projectId: projectId
+            });
+        }
+
+        function copyAsJson(instance, projectId) {
+            vscode.postMessage({
+                type: 'copyAsJson',
+                instance: instance,
+                projectId: projectId
+            });
+        }
+
+        function exportAsFile(instance, projectId, format) {
+            vscode.postMessage({
+                type: 'exportAsFile',
+                instance: instance,
+                projectId: projectId,
+                format: format
+            });
+        }
+        
+        function importFromFile(instance, projectId) {
+            vscode.postMessage({
+                type: 'importFromFile',
+                instance: instance,
+                projectId: projectId
+            });
+        }
+
+        function handleFileUpload(instance, projectId, fileInput) {
+            if (fileInput.files.length > 0) {
+                const file = fileInput.files[0];
+                const reader = new FileReader();
+                
+                reader.onload = function(e) {
+                    const content = e.target.result;
+                    const pasteArea = document.getElementById('paste-area-' + instance);
+                    pasteArea.value = content;
+                    
+                    // Reset the file input
+                    fileInput.value = '';
+                };
+                
+                reader.readAsText(file);
+            }
+        }
 
         function handlePaste(instance, projectId) {
             const pasteArea = document.getElementById('paste-area-' + instance);
@@ -870,6 +2029,36 @@ function updateProjectPanel(
                 return;
             }
 
+            // Try to parse as JSON first
+            try {
+                const jsonData = JSON.parse(content);
+                const variables = [];
+                
+                for (const [key, value] of Object.entries(jsonData)) {
+                    if (typeof value === 'string') {
+                        variables.push({ key, value });
+                    } else if (typeof value === 'object' && !Array.isArray(value)) {
+                        // This may be an already encrypted value, skip it
+                        // We'll handle it in the extension code
+                    }
+                }
+                
+                if (variables.length > 0) {
+                    vscode.postMessage({
+                        type: 'addMultipleVariables',
+                        instance: instance,
+                        projectId: projectId,
+                        variables: variables
+                    });
+                    
+                    pasteArea.value = '';
+                    return;
+                }
+            } catch (e) {
+                // Not valid JSON, try to parse as .env format
+            }
+
+            // Parse as .env format
             const lines = content.split('\\n');
             const variables = [];
 
@@ -890,6 +2079,8 @@ function updateProjectPanel(
                 });
 
                 pasteArea.value = '';
+            } else {
+                alert('Could not parse input. Please use KEY=VALUE format or valid JSON.');
             }
         }
 
@@ -928,8 +2119,11 @@ function updateProjectPanel(
             if (event.key === 'Enter') {
                 const target = event.target;
                 if (target.id && target.id.startsWith('new-')) {
-                    const instance = target.id.split('-')[2];
-                    addVariable(instance, '${project.id}');
+                    const parts = target.id.split('-');
+                    if (parts.length === 3) {
+                        const instance = parts[2];
+                        addVariable(instance, '${project.id}');
+                    }
                 }
             }
         });
