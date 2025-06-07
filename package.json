@@ -3,7 +3,7 @@
   "displayName": "tryEnv",
   "publisher": "tryenv",
   "description": "tryEnv  is a collaboratively built developer tool by a team of Developers who faced issues while managing their projects' environment variables and not having a streamlined, transparent and seamless management system to do the same.",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "icon": "./resources/tryEnv_logo.jpg",
   "engines": {
     "vscode": "^1.95.0"
